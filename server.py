@@ -167,7 +167,7 @@ def _mk_quote(symbol, price, prev, closes):
         'price': price,
         'prevClose': prev,
         'changePct': round(chg, 2) if chg is not None else None,
-        'spark': [c for c in (closes or []) if c is not None][-40:],
+        'spark': [c for c in (closes or []) if isinstance(c, (int, float))][-40:],
     }
 
 
@@ -262,7 +262,9 @@ def cboe_quote(sym, with_chart=False):
                 pts = pts[0]['data_points']
             for p in pts:
                 v = p.get('price') if isinstance(p, dict) else None
-                if v:
+                if isinstance(v, dict):  # index feeds: price is an OHLC object
+                    v = v.get('close')
+                if isinstance(v, (int, float)):
                     closes.append(v)
         except Exception:
             pass

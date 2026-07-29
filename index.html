@@ -86,7 +86,8 @@ header{display:flex;justify-content:space-between;align-items:baseline;
   background:var(--line);border:1px solid var(--line);border-radius:12px;overflow:hidden}
 .gcell{background:var(--bg);padding:15px 16px}
 .gcell:hover{background:var(--panel)}
-.gcell .cn{font-size:12px;color:var(--dim);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.gcell .cn{font-size:12px;color:var(--dim);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;display:flex;justify-content:space-between;gap:8px}
+.gcell .gsize{color:var(--acc);font-weight:650;font-size:11.5px;letter-spacing:.02em}
 .gcell .gv{font-size:19px;font-weight:700;margin-top:4px}
 .gcell .gy{font-size:10.5px;color:var(--dim2);margin-left:6px;font-weight:400}
 .gbars{display:flex;align-items:flex-end;gap:3px;height:34px;margin-top:10px}
@@ -159,19 +160,41 @@ function spark(vals, chg) {
       stroke-linejoin="round" stroke-linecap="round" vector-effect="non-scaling-stroke"/></svg>`;
 }
 
-async function j(url) { const r = await fetch(url); return r.json(); }
+async function j(url) {
+  const r = await fetch(url);
+  const d = await r.json();
+  if (d && d.error) throw new Error(d.error);
+  return d;
+}
+
+// resilient loader: keeps retrying with backoff instead of showing nothing
+const retryTimers = {};
+function resilient(name, fn, el, intervalMs = 20000, maxTries = 30) {
+  clearTimeout(retryTimers[name]);
+  let tries = 0;
+  const attempt = async () => {
+    tries++;
+    try { await fn(); }
+    catch (e) {
+      if (el && $(el)) $(el).innerHTML =
+        `<div class="skel">Loading… retrying (${tries}) — data source waking up.</div>`;
+      if (tries < maxTries)
+        retryTimers[name] = setTimeout(attempt, Math.min(intervalMs * Math.pow(1.3, Math.min(tries, 8)), 120000));
+    }
+  };
+  return attempt();
+}
 
 async function loadMarkets() {
-  try {
-    const data = await j('/api/markets');
-    $('markets').innerHTML = data.map(q => `
-      <div class="mcell">
-        <div class="n">${q.name}</div>
-        <div class="p num">${fmtP(q.price)}</div>
-        <div class="c num ${cls(q.changePct)}">${sign(q.changePct)}</div>
-        ${spark(q.spark, q.changePct)}
-      </div>`).join('');
-  } catch (e) { $('markets').innerHTML = '<div class="skel">Markets unavailable — retrying shortly.</div>'; }
+  const data = await j('/api/markets');
+  if (!data.length || data.every(q => q.price == null)) throw new Error('empty');
+  $('markets').innerHTML = data.map(q => `
+    <div class="mcell">
+      <div class="n">${q.name}</div>
+      <div class="p num">${fmtP(q.price)}</div>
+      <div class="c num ${cls(q.changePct)}">${sign(q.changePct)}</div>
+      ${spark(q.spark, q.changePct)}
+    </div>`).join('');
 }
 
 let themeNames = [], activeTheme = 'ai';
@@ -182,44 +205,41 @@ async function loadChips() {
   $('chips').querySelectorAll('.chip').forEach(b => b.onclick = () => {
     activeTheme = b.dataset.t;
     $('chips').querySelectorAll('.chip').forEach(x => x.classList.toggle('on', x === b));
-    loadTheme();
+    $('theme').innerHTML = '<div class="skel">Loading…</div>';
+    resilient('theme', loadTheme, 'theme');
   });
 }
 async function loadTheme() {
-  $('theme').innerHTML = '<div class="skel">Loading…</div>';
-  try {
-    const data = await j('/api/theme/' + activeTheme);
-    const rows = data.filter(q => q.price != null)
-      .sort((a, b) => (b.changePct ?? -99) - (a.changePct ?? -99));
-    $('theme').innerHTML = rows.map(q => `
-      <div class="row">
-        <div><div class="sym">${q.symbol.replace('-USD','').replace('.SW','')}</div>
-             <div class="nm">${q.name}</div></div>
-        ${spark(q.spark, q.changePct)}
-        <div class="pr num">${fmtP(q.price)}</div>
-        <div class="ch num ${cls(q.changePct)}">${sign(q.changePct)}</div>
-      </div>`).join('');
-  } catch (e) { $('theme').innerHTML = '<div class="skel">Unavailable.</div>'; }
+  const data = await j('/api/theme/' + activeTheme);
+  const rows = data.filter(q => q.price != null)
+    .sort((a, b) => (b.changePct ?? -99) - (a.changePct ?? -99));
+  if (!rows.length) throw new Error('empty');
+  $('theme').innerHTML = rows.map(q => `
+    <div class="row">
+      <div><div class="sym">${q.symbol.replace('-USD','').replace('.SW','')}</div>
+           <div class="nm">${q.name}</div></div>
+      ${spark(q.spark, q.changePct)}
+      <div class="pr num">${fmtP(q.price)}</div>
+      <div class="ch num ${cls(q.changePct)}">${sign(q.changePct)}</div>
+    </div>`).join('');
 }
 
 async function loadMovers() {
-  try {
-    const d = await j('/api/movers');
-    const col = (title, arr) => `
-      <div class="mvcol"><div class="mvh">${title}</div>
-      ${arr.map(q => `<div class="mvrow"><div><b>${q.symbol.replace('.SW','')}</b>
-        <span class="nm">${q.name}</span></div>
-        <div class="num ${cls(q.changePct)}">${sign(q.changePct)}</div></div>`).join('')}</div>`;
-    $('movers').innerHTML = col('Gainers', d.gainers) + col('Losers', d.losers);
-  } catch (e) { $('movers').innerHTML = '<div class="skel">Unavailable.</div>'; }
+  const d = await j('/api/movers');
+  if (!d.gainers || !d.gainers.length) throw new Error('empty');
+  const col = (title, arr) => `
+    <div class="mvcol"><div class="mvh">${title}</div>
+    ${arr.map(q => `<div class="mvrow"><div><b>${q.symbol.replace('.SW','')}</b>
+      <span class="nm">${q.name}</span></div>
+      <div class="num ${cls(q.changePct)}">${sign(q.changePct)}</div></div>`).join('')}</div>`;
+  $('movers').innerHTML = col('Gainers', d.gainers) + col('Losers', d.losers);
 }
 
 let newsItems = [], newsCat = 'all';
 async function loadNews() {
-  try {
-    newsItems = await j('/api/news');
-    renderNews();
-  } catch (e) { $('news').innerHTML = '<div class="skel">News unavailable.</div>'; }
+  newsItems = await j('/api/news');
+  if (!newsItems.length) throw new Error('empty');
+  renderNews();
 }
 function renderNews() {
   const items = newsItems.filter(n => newsCat === 'all' || n.category === newsCat).slice(0, 18);
@@ -238,24 +258,28 @@ $('ntabs').querySelectorAll('.chip').forEach(b => b.onclick = () => {
   renderNews();
 });
 
+const fmtGdp = v => v == null ? '' :
+  v >= 1e12 ? '$' + (v / 1e12).toFixed(v >= 1e13 ? 1 : 2) + 'T' :
+  '$' + Math.round(v / 1e9) + 'B';
+
 async function loadGdp() {
-  try {
-    const data = await j('/api/gdp');
-    $('gdp').innerHTML = data.map(c => {
-      const vals = c.series.map(s => s.value);
-      const maxAbs = Math.max(...vals.map(Math.abs), 1);
-      const bars = c.series.map(s =>
-        `<div class="gbar ${s.value >= 0 ? 'pos' : 'neg'}" title="${s.year}: ${s.value}%"
-          style="height:${Math.max(6, Math.abs(s.value) / maxAbs * 100)}%"></div>`).join('');
-      return `<div class="gcell">
-        <div class="cn">${c.name}</div>
-        <div class="gv num ${cls(c.latest)}">${c.latest > 0 ? '+' : ''}${c.latest}%
-          <span class="gy">${c.latestYear}</span></div>
-        <div class="gbars">${bars}</div>
-        <div class="gyrs"><span>${c.series[0].year}</span><span>${c.latestYear}</span></div>
-      </div>`;
-    }).join('');
-  } catch (e) { $('gdp').innerHTML = '<div class="skel">GDP data unavailable.</div>'; }
+  const data = await j('/api/gdp');
+  if (!data.length) throw new Error('empty');
+  $('gdp').innerHTML = data.map(c => {
+    const vals = c.series.map(s => s.value);
+    const maxAbs = Math.max(...vals.map(Math.abs), 1);
+    const bars = c.series.map(s =>
+      `<div class="gbar ${s.value >= 0 ? 'pos' : 'neg'}" title="${s.year}: ${s.value}%"
+        style="height:${Math.max(6, Math.abs(s.value) / maxAbs * 100)}%"></div>`).join('');
+    return `<div class="gcell">
+      <div class="cn">${c.name}
+        <span class="gsize num">${fmtGdp(c.gdpUsd)}</span></div>
+      <div class="gv num ${cls(c.latest)}">${c.latest > 0 ? '+' : ''}${c.latest}%
+        <span class="gy">growth ${c.latestYear}</span></div>
+      <div class="gbars">${bars}</div>
+      <div class="gyrs"><span>${c.series[0].year}</span><span>${c.latestYear}</span></div>
+    </div>`;
+  }).join('');
 }
 
 function tick() {
@@ -265,14 +289,23 @@ function tick() {
 }
 function stamp() { $('updated').textContent = 'Updated ' + new Date().toLocaleTimeString('en-GB'); }
 
-async function refresh() {
-  await Promise.all([loadMarkets(), loadTheme(), loadMovers(), loadNews(), loadGdp()]);
+function refresh() {
+  resilient('markets', loadMarkets, 'markets');
+  resilient('theme', loadTheme, 'theme');
+  resilient('movers', loadMovers, 'movers');
+  resilient('news', loadNews, 'news');
+  resilient('gdp', loadGdp, 'gdp');
   stamp();
 }
 tick(); setInterval(tick, 30000);
-loadChips().then(refresh);
-setInterval(() => { loadMarkets(); loadTheme(); loadMovers(); stamp(); }, 5 * 60 * 1000);
-setInterval(loadNews, 10 * 60 * 1000);
+loadChips().then(refresh).catch(() => setTimeout(() => loadChips().then(refresh), 15000));
+setInterval(() => {
+  resilient('markets', loadMarkets, 'markets');
+  resilient('theme', loadTheme, 'theme');
+  resilient('movers', loadMovers, 'movers');
+  stamp();
+}, 5 * 60 * 1000);
+setInterval(() => resilient('news', loadNews, 'news'), 10 * 60 * 1000);
 </script>
 </body>
 </html>

@@ -300,34 +300,69 @@ def get_news():
     return cached('news', 600, build)
 
 
-# ── world bank gdp ──────────────────────────────────────────────
+# ── world bank gdp (growth % + absolute level in current USD) ────
+def _wb_indicator(indicator):
+    codes = ';'.join(GDP_COUNTRIES)
+    url = (f'https://api.worldbank.org/v2/country/{codes}/indicator/'
+           f'{indicator}?format=json&per_page=400&date=2015:2026')
+    d = json.loads(fetch(url, timeout=15))
+    rows = d[1] if len(d) > 1 and d[1] else []
+    by_c = {}
+    for r in rows:
+        iso = r.get('countryiso3code')
+        val = r.get('value')
+        if not iso or val is None:
+            continue
+        by_c.setdefault(iso, {'name': r['country']['value'], 'series': []})
+        by_c[iso]['series'].append((int(r['date']), val))
+    return by_c
+
+
 def get_gdp():
     def build():
-        codes = ';'.join(GDP_COUNTRIES)
-        url = (f'https://api.worldbank.org/v2/country/{codes}/indicator/'
-               f'NY.GDP.MKTP.KD.ZG?format=json&per_page=400&date=2015:2026')
-        d = json.loads(fetch(url, timeout=15))
-        rows = d[1] if len(d) > 1 and d[1] else []
-        by_c = {}
-        for r in rows:
-            iso = r.get('countryiso3code')
-            val = r.get('value')
-            year = r.get('date')
-            if not iso or val is None:
-                continue
-            by_c.setdefault(iso, {'name': r['country']['value'], 'series': []})
-            by_c[iso]['series'].append((int(year), round(val, 2)))
+        growth = _wb_indicator('NY.GDP.MKTP.KD.ZG')
+        level = _wb_indicator('NY.GDP.MKTP.CD')  # current US$
         out = []
         for iso in GDP_COUNTRIES:
-            c = by_c.get(iso)
-            if not c:
+            g = growth.get(iso)
+            if not g:
                 continue
-            series = sorted(c['series'])[-8:]
-            out.append({'iso': iso, 'name': c['name'],
-                        'latestYear': series[-1][0], 'latest': series[-1][1],
-                        'series': [{'year': y, 'value': v} for y, v in series]})
+            series = sorted(g['series'])[-8:]
+            lvl = None
+            lv = level.get(iso)
+            if lv and lv['series']:
+                lvl = sorted(lv['series'])[-1][1]  # latest absolute GDP
+            out.append({
+                'iso': iso, 'name': g['name'],
+                'latestYear': series[-1][0],
+                'latest': round(series[-1][1], 2),
+                'gdpUsd': lvl,
+                'series': [{'year': y, 'value': round(v, 2)} for y, v in series],
+            })
+        out.sort(key=lambda c: -(c['gdpUsd'] or 0))
         return out
     return cached('gdp', 86400, build)
+
+
+# ── source diagnostics (temporary helper) ───────────────────────
+def probe_sources():
+    tests = {
+        'yahoo_q1_spark': 'https://query1.finance.yahoo.com/v8/finance/spark?symbols=NVDA&range=1d&interval=15m',
+        'yahoo_q2_spark': 'https://query2.finance.yahoo.com/v8/finance/spark?symbols=NVDA&range=1d&interval=15m',
+        'yahoo_q2_chart': 'https://query2.finance.yahoo.com/v8/finance/chart/NVDA?range=1d&interval=15m',
+        'cboe_spx': 'https://cdn.cboe.com/api/global/delayed_quotes/quotes/_SPX.json',
+        'cboe_nvda': 'https://cdn.cboe.com/api/global/delayed_quotes/quotes/NVDA.json',
+        'coingecko': 'https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd',
+        'frankfurter': 'https://api.frankfurter.dev/v1/latest?base=USD&symbols=CHF',
+    }
+    out = {}
+    for name, url in tests.items():
+        try:
+            body = fetch(url, timeout=10)
+            out[name] = f'OK {len(body)}b: ' + body[:60].decode(errors='replace')
+        except Exception as e:
+            out[name] = f'FAIL: {str(e)[:80]}'
+    return out
 
 
 # ── http server ─────────────────────────────────────────────────
@@ -361,6 +396,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self._json(get_news())
             if path == '/api/gdp':
                 return self._json(get_gdp())
+            if path == '/api/debug/sources':
+                return self._json(probe_sources())
             if path == '/health':
                 return self._json({'status': 'ok'})
             if path in ('/', '/index.html'):

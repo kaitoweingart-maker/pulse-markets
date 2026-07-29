@@ -11,6 +11,7 @@ import re
 import ssl
 import threading
 import time
+import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 from email.utils import parsedate_to_datetime
@@ -102,10 +103,60 @@ def cached(key, ttl, fn):
     return val
 
 
-def fetch(url, timeout=12):
-    req = urllib.request.Request(url, headers={'User-Agent': UA})
+def fetch(url, timeout=12, headers=None):
+    h = {'User-Agent': UA}
+    if headers:
+        h.update(headers)
+    req = urllib.request.Request(url, headers=h)
     with urllib.request.urlopen(req, context=ssl_ctx, timeout=timeout) as r:
         return r.read()
+
+
+# ── yahoo session (cookie + crumb — required from datacenter IPs) ──
+_yh = {'cookie': None, 'crumb': None, 'ts': 0}
+
+
+def _yahoo_session(force=False):
+    with _lock:
+        fresh = _yh['cookie'] and time.time() - _yh['ts'] < 3000
+        if fresh and not force:
+            return _yh['cookie'], _yh['crumb']
+    cookie = None
+    req = urllib.request.Request('https://fc.yahoo.com/', headers={'User-Agent': UA})
+    try:
+        urllib.request.urlopen(req, context=ssl_ctx, timeout=10)
+    except urllib.error.HTTPError as e:  # 404/999 is fine — we want the cookie
+        cookie = e.headers.get('Set-Cookie', '')
+    except Exception:
+        pass
+    if cookie:
+        cookie = cookie.split(';')[0]
+    crumb = None
+    if cookie:
+        try:
+            crumb = fetch('https://query1.finance.yahoo.com/v1/test/getcrumb',
+                          headers={'Cookie': cookie}).decode().strip()
+        except Exception:
+            crumb = None
+    with _lock:
+        _yh.update(cookie=cookie, crumb=crumb, ts=time.time())
+    return cookie, crumb
+
+
+def yahoo_fetch(url, timeout=15):
+    cookie, crumb = _yahoo_session()
+    if crumb:
+        url += ('&' if '?' in url else '?') + 'crumb=' + urllib.parse.quote(crumb)
+    headers = {'Cookie': cookie} if cookie else None
+    try:
+        return fetch(url, timeout=timeout, headers=headers)
+    except urllib.error.HTTPError as e:
+        if e.code in (401, 403, 429):  # refresh session once and retry
+            cookie, crumb = _yahoo_session(force=True)
+            headers = {'Cookie': cookie} if cookie else None
+            time.sleep(1.2)
+            return fetch(url, timeout=timeout, headers=headers)
+        raise
 
 
 # ── yahoo quotes (batched spark endpoint: many symbols, one call) ──
@@ -155,7 +206,7 @@ def spark_batch(symbols, rng='1d', interval='15m'):
     last_err = None
     for attempt in range(3):
         try:
-            return _parse_spark(json.loads(fetch(url, timeout=15)))
+            return _parse_spark(json.loads(yahoo_fetch(url)))
         except Exception as e:
             last_err = e
             time.sleep(1.5 * (attempt + 1))

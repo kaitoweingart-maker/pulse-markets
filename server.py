@@ -41,7 +41,7 @@ MARKETS = [
     ('^N225', 'Nikkei 225'), ('^HSI', 'Hang Seng'),
     ('EURUSD=X', 'EUR/USD'), ('CHF=X', 'USD/CHF'),
     ('GC=F', 'Gold'), ('CL=F', 'WTI Crude'),
-    ('BTC-USD', 'Bitcoin'), ('^TNX', 'US 10Y Yield'),
+    ('BTC-USD', 'Bitcoin'), ('^TNX', 'US 10Y Yield'), ('^VIX', 'VIX'),
 ]
 
 THEMES = {
@@ -213,22 +213,137 @@ def spark_batch(symbols, rng='1d', interval='15m'):
     raise last_err
 
 
-def quotes_for(pairs):
+# ── fallback sources (Yahoo blocks many datacenter IPs) ─────────
+# Cboe delayed-quotes CDN: index products, US stocks, ETFs, liquid ADRs
+CBOE_MAP = {
+    '^GSPC': ('_SPX', 1, None),
+    '^IXIC': ('_NDX', 1, 'Nasdaq 100'),
+    '^DJI': ('_DJX', 100, None),
+    '^TNX': ('_TNX', 0.1, None),
+    '^VIX': ('_VIX', 1, None),
+    '^SSMI': ('EWL', 1, 'Switzerland · EWL'),
+    '^GDAXI': ('EWG', 1, 'Germany · EWG'),
+    '^FTSE': ('EWU', 1, 'UK · EWU'),
+    '^N225': ('EWJ', 1, 'Japan · EWJ'),
+    '^HSI': ('EWH', 1, 'Hong Kong · EWH'),
+    'GC=F': ('GLD', 1, 'Gold · GLD'),
+    'CL=F': ('USO', 1, 'Oil · USO'),
+    # European/Swiss listings via US ADRs / NYSE lines
+    'NESN.SW': ('NSRGY', 1, None), 'NOVN.SW': ('NVS', 1, None),
+    'ROG.SW': ('RHHBY', 1, None), 'UBSG.SW': ('UBS', 1, None),
+    'ZURN.SW': ('ZURVY', 1, None), 'ABBN.SW': ('ABB', 1, None),
+    'CFR.SW': ('CFRUY', 1, None), 'LONN.SW': ('LZAGY', 1, None),
+    'SIKA.SW': ('SXYAY', 1, None), 'HOLN.SW': ('HCMLY', 1, None),
+    'RHM.DE': ('RNMBY', 1, None), 'HO.PA': ('THLLY', 1, None),
+    'BA.L': ('BAESY', 1, None), 'LDO.MI': ('FINMY', 1, None),
+    'SAAB-B.ST': ('SAABY', 1, None), 'VWS.CO': ('VWDRY', 1, None),
+    'BRK-B': ('BRK.B', 1, None),
+}
+COINBASE = {'BTC-USD', 'ETH-USD', 'SOL-USD', 'XRP-USD', 'ADA-USD',
+            'AVAX-USD', 'DOGE-USD'}
+FRANKFURTER = {'EURUSD=X': ('EUR', 'USD'), 'CHF=X': ('USD', 'CHF')}
+
+
+def cboe_quote(sym, with_chart=False):
+    cboe_sym, mult, rename = CBOE_MAP.get(sym) or (sym, 1, None)
+    d = json.loads(fetch(
+        f'https://cdn.cboe.com/api/global/delayed_quotes/quotes/{cboe_sym}.json',
+        timeout=10))['data']
+    price = d.get('current_price')
+    prev = d.get('prev_day_close')
+    closes = []
+    if with_chart:
+        try:  # intraday chart for the sparkline (best effort)
+            ch = json.loads(fetch(
+                f'https://cdn.cboe.com/api/global/delayed_quotes/charts/intraday/{cboe_sym}.json',
+                timeout=10))
+            pts = ch.get('data') or []
+            if pts and isinstance(pts[0], dict) and 'data_points' in pts[0]:
+                pts = pts[0]['data_points']
+            for p in pts:
+                v = p.get('price') if isinstance(p, dict) else None
+                if v:
+                    closes.append(v)
+        except Exception:
+            pass
+    if not closes and prev and price:
+        closes = [prev, price]
+    if mult != 1:
+        price = price * mult if price else price
+        prev = prev * mult if prev else prev
+        closes = [c * mult for c in closes if c]
+    q = _mk_quote(sym, price, prev, closes)
+    if rename:
+        q['rename'] = rename
+    return q
+
+
+def coinbase_quote(sym):
+    spot = json.loads(fetch(
+        f'https://api.coinbase.com/v2/prices/{sym}/spot', timeout=10))
+    price = float(spot['data']['amount'])
+    closes, prev = [], None
+    try:
+        candles = json.loads(fetch(
+            f'https://api.exchange.coinbase.com/products/{sym}/candles?granularity=3600',
+            timeout=10))[:24]
+        closes = [c[4] for c in reversed(candles)]
+        prev = closes[0] if closes else None
+    except Exception:
+        pass
+    return _mk_quote(sym, price, prev, closes + [price])
+
+
+def frankfurter_quote(sym):
+    base, target = FRANKFURTER[sym]
+    hist = json.loads(fetch(
+        f'https://api.frankfurter.dev/v1/2026-06-25..?base={base}&symbols={target}',
+        timeout=10))
+    days = sorted(hist['rates'].items())
+    closes = [v[target] for _, v in days]
+    price = closes[-1] if closes else None
+    prev = closes[-2] if len(closes) > 1 else None
+    return _mk_quote(sym, price, prev, closes)
+
+
+def fallback_quote(sym, with_chart=False):
+    if sym in FRANKFURTER:
+        return frankfurter_quote(sym)
+    if sym in COINBASE:
+        return coinbase_quote(sym)
+    if sym in CBOE_MAP or (sym.replace('.', '').isalpha() and sym.isupper()):
+        return cboe_quote(sym, with_chart=with_chart)
+    raise ValueError('no fallback source')
+
+
+def quotes_for(pairs, with_chart=False):
     quotes = {}
     syms = [s for s, _ in pairs]
-    for i in range(0, len(syms), 20):  # chunk to keep URLs sane
-        quotes.update(spark_batch(syms[i:i + 20]))
+    try:  # primary: Yahoo batched spark (works from residential IPs)
+        for i in range(0, len(syms), 20):
+            quotes.update(spark_batch(syms[i:i + 20]))
+    except Exception:
+        pass
+    for sym in syms:  # fill gaps via fallback sources, politely throttled
+        q = quotes.get(sym)
+        if q and q.get('price') is not None:
+            continue
+        try:
+            quotes[sym] = fallback_quote(sym, with_chart=with_chart)
+        except Exception:
+            pass
+        time.sleep(0.12)
     out = []
     for sym, name in pairs:
         q = quotes.get(sym) or {'symbol': sym, 'price': None,
                                 'changePct': None, 'spark': []}
-        q['name'] = name
+        q['name'] = q.pop('rename', None) or name
         out.append(q)
     return out
 
 
 def get_markets():
-    return cached('markets', 180, lambda: quotes_for(MARKETS))
+    return cached('markets', 240, lambda: quotes_for(MARKETS, with_chart=True))
 
 
 def get_theme(name):
@@ -305,7 +420,7 @@ def _wb_indicator(indicator):
     codes = ';'.join(GDP_COUNTRIES)
     url = (f'https://api.worldbank.org/v2/country/{codes}/indicator/'
            f'{indicator}?format=json&per_page=400&date=2015:2026')
-    d = json.loads(fetch(url, timeout=15))
+    d = json.loads(fetch(url, timeout=25))
     rows = d[1] if len(d) > 1 and d[1] else []
     by_c = {}
     for r in rows:
@@ -320,8 +435,20 @@ def _wb_indicator(indicator):
 
 def get_gdp():
     def build():
-        growth = _wb_indicator('NY.GDP.MKTP.KD.ZG')
-        level = _wb_indicator('NY.GDP.MKTP.CD')  # current US$
+        res = {}
+
+        def load(key, ind):
+            try:
+                res[key] = _wb_indicator(ind)
+            except Exception:
+                res[key] = {}
+        t1 = threading.Thread(target=load, args=('g', 'NY.GDP.MKTP.KD.ZG'))
+        t2 = threading.Thread(target=load, args=('l', 'NY.GDP.MKTP.CD'))
+        t1.start(); t2.start(); t1.join(); t2.join()
+        growth = res.get('g') or {}
+        level = res.get('l') or {}  # current US$
+        if not growth:
+            raise RuntimeError('worldbank unavailable')
         out = []
         for iso in GDP_COUNTRIES:
             g = growth.get(iso)

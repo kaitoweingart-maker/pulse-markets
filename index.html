@@ -90,10 +90,12 @@ header{display:flex;justify-content:space-between;align-items:baseline;
 .gcell .gsize{color:var(--acc);font-weight:650;font-size:11.5px;letter-spacing:.02em}
 .gcell .gv{font-size:19px;font-weight:700;margin-top:4px}
 .gcell .gy{font-size:10.5px;color:var(--dim2);margin-left:6px;font-weight:400}
-.gbars{display:flex;align-items:flex-end;gap:3px;height:34px;margin-top:10px}
-.gbar{flex:1;border-radius:2px 2px 0 0;min-height:2px;position:relative}
-.gbar.pos{background:rgba(52,211,153,.55)}
-.gbar.neg{background:rgba(248,113,113,.55);align-self:flex-start;border-radius:0 0 2px 2px}
+.gbars{display:flex;gap:3px;height:34px;margin-top:10px;position:relative}
+.gbar{flex:1;position:relative}
+.gbar i{position:absolute;left:0;right:0;min-height:2px}
+.gbar.pos i{background:rgba(52,211,153,.55);border-radius:2px 2px 0 0}
+.gbar.neg i{background:rgba(248,113,113,.55);border-radius:0 0 2px 2px}
+.gzero{position:absolute;left:0;right:0;height:1px;background:var(--line)}
 .gyrs{display:flex;justify-content:space-between;font-size:9px;color:var(--dim2);margin-top:4px}
 
 footer{margin-top:56px;padding-top:16px;border-top:1px solid var(--line);
@@ -267,16 +269,22 @@ async function loadGdp() {
   if (!data.length) throw new Error('empty');
   $('gdp').innerHTML = data.map(c => {
     const vals = c.series.map(s => s.value);
-    const maxAbs = Math.max(...vals.map(Math.abs), 1);
-    const bars = c.series.map(s =>
-      `<div class="gbar ${s.value >= 0 ? 'pos' : 'neg'}" title="${s.year}: ${s.value}%"
-        style="height:${Math.max(6, Math.abs(s.value) / maxAbs * 100)}%"></div>`).join('');
+    const maxPos = Math.max(0, ...vals);
+    const maxNeg = Math.max(0, ...vals.map(v => -v));
+    const range = Math.max(maxPos + maxNeg, 0.1);
+    const base = maxNeg / range * 100; // Nulllinie in % von unten, für alle Balken der Zelle gleich
+    const bars = c.series.map(s => {
+      const h = Math.max(4, Math.abs(s.value) / range * 100);
+      const pos = s.value >= 0;
+      return `<div class="gbar ${pos ? 'pos' : 'neg'}" title="${s.year}: ${s.value}%">
+        <i style="height:${h}%;bottom:${pos ? base : Math.max(0, base - h)}%"></i></div>`;
+    }).join('');
     return `<div class="gcell">
       <div class="cn">${c.name}
         <span class="gsize num">${fmtGdp(c.gdpUsd)}</span></div>
       <div class="gv num ${cls(c.latest)}">${c.latest > 0 ? '+' : ''}${c.latest}%
         <span class="gy">growth ${c.latestYear}</span></div>
-      <div class="gbars">${bars}</div>
+      <div class="gbars"><div class="gzero" style="bottom:${base}%"></div>${bars}</div>
       <div class="gyrs"><span>${c.series[0].year}</span><span>${c.latestYear}</span></div>
     </div>`;
   }).join('');

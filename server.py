@@ -404,7 +404,7 @@ def get_theme(name):
     pairs = THEMES.get(name)
     if not pairs:
         return None
-    return cached(f'theme:{name}', 300, lambda: quotes_for(pairs))
+    return cached(f'theme:{name}', 300, lambda: quotes_for(pairs, with_chart=True))
 
 
 def get_movers():

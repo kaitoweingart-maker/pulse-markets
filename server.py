@@ -363,16 +363,29 @@ def quotes_for(pairs, with_chart=False):
             quotes.update(spark_batch(syms[i:i + 20]))
     except Exception:
         pass
+    def needs_fetch(s):
+        q = quotes.get(s)
+        if not q or q.get('price') is None:
+            return True
+        # a 2-point spark is the chartless [prev, price] stopgap — worth a retry
+        return with_chart and len(q.get('spark') or []) <= 2
+
     for attempt in range(2):  # fill gaps via fallback sources, politely throttled
-        missing = [s for s in syms
-                   if not (quotes.get(s) and quotes[s].get('price') is not None)]
+        missing = [s for s in syms if needs_fetch(s)]
         if not missing:
             break
         if attempt:
             time.sleep(1.5)  # let the Cboe rate limiter cool off before retrying
         for sym in missing:
             try:
-                quotes[sym] = fallback_quote(sym, with_chart=with_chart)
+                q = fallback_quote(sym, with_chart=with_chart)
+                prev_q = quotes.get(sym)
+                if (prev_q and prev_q.get('price') is not None
+                        and len(q.get('spark') or []) <= 2
+                        and len(prev_q.get('spark') or []) > 2):
+                    pass  # retry produced a worse spark — keep what we have
+                else:
+                    quotes[sym] = q
             except Exception:
                 pass
             time.sleep(0.25)
@@ -380,6 +393,12 @@ def quotes_for(pairs, with_chart=False):
     for sym, name in pairs:
         q = quotes.get(sym)
         if q and q.get('price') is not None:
+            held = _LAST_GOOD.get(sym)
+            if (held and len(held.get('spark') or []) > 2
+                    and len(q.get('spark') or []) <= 2):
+                # never downgrade a real intraday shape to a straight line:
+                # reuse the last good series, extended with the fresh price
+                q['spark'] = (held['spark'] + [q['price']])[-40:]
             _LAST_GOOD[sym] = q
         else:
             q = _LAST_GOOD.get(sym)

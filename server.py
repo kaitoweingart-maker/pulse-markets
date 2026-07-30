@@ -160,14 +160,22 @@ def yahoo_fetch(url, timeout=15):
 
 
 # ── yahoo quotes (batched spark endpoint: many symbols, one call) ──
-def _mk_quote(symbol, price, prev, closes):
-    chg = ((price - prev) / prev * 100) if (price is not None and prev) else None
+def _mk_quote(symbol, price, prev, closes, chg_pct=None):
+    spark = [c for c in (closes or []) if isinstance(c, (int, float)) and c > 0]
+    if len(spark) >= 5:  # drop glitch points (zero prints, bad ticks) far off the median
+        med = sorted(spark)[len(spark) // 2]
+        spark = [c for c in spark if abs(c - med) <= med * 0.12]
+    chg = chg_pct
+    if chg is None and price is not None and prev and abs(price - prev) > 1e-9:
+        chg = (price - prev) / prev * 100
+    if chg is None and price and len(spark) > 1:
+        chg = (price - spark[0]) / spark[0] * 100
     return {
         'symbol': symbol,
         'price': price,
         'prevClose': prev,
         'changePct': round(chg, 2) if chg is not None else None,
-        'spark': [c for c in (closes or []) if isinstance(c, (int, float))][-40:],
+        'spark': spark[-40:],
     }
 
 
@@ -251,6 +259,13 @@ def cboe_quote(sym, with_chart=False):
         timeout=10))['data']
     price = d.get('current_price')
     prev = d.get('prev_day_close')
+    # after the session Cboe rolls prev_day_close onto the close (change would
+    # read 0.00%) — the real day move sits in price_change_percent
+    chg_pct = d.get('price_change_percent')
+    if not isinstance(chg_pct, (int, float)):
+        chg_pct = None
+    elif price and chg_pct > -100:
+        prev = price / (1 + chg_pct / 100)
     closes = []
     if with_chart:
         try:  # intraday chart for the sparkline (best effort)
@@ -274,7 +289,7 @@ def cboe_quote(sym, with_chart=False):
         price = price * mult if price else price
         prev = prev * mult if prev else prev
         closes = [c * mult for c in closes if c]
-    q = _mk_quote(sym, price, prev, closes)
+    q = _mk_quote(sym, price, prev, closes, chg_pct=chg_pct)
     if rename:
         q['rename'] = rename
     return q
@@ -296,6 +311,25 @@ def coinbase_quote(sym):
     return _mk_quote(sym, price, prev, closes + [price])
 
 
+def kraken_quote(sym):
+    pair = sym.replace('-USD', 'USD').replace('BTC', 'XBT')
+    o = json.loads(fetch(
+        f'https://api.kraken.com/0/public/OHLC?pair={pair}&interval=60',
+        timeout=10))
+    key = next(k for k in o['result'] if k != 'last')
+    closes = [float(c[4]) for c in o['result'][key][-24:]]
+    price = closes[-1] if closes else None
+    prev = closes[0] if closes else None
+    return _mk_quote(sym, price, prev, closes)
+
+
+def crypto_quote(sym):
+    try:
+        return coinbase_quote(sym)
+    except Exception:
+        return kraken_quote(sym)
+
+
 def frankfurter_quote(sym):
     base, target = FRANKFURTER[sym]
     hist = json.loads(fetch(
@@ -312,10 +346,13 @@ def fallback_quote(sym, with_chart=False):
     if sym in FRANKFURTER:
         return frankfurter_quote(sym)
     if sym in COINBASE:
-        return coinbase_quote(sym)
+        return crypto_quote(sym)
     if sym in CBOE_MAP or (sym.replace('.', '').isalpha() and sym.isupper()):
         return cboe_quote(sym, with_chart=with_chart)
     raise ValueError('no fallback source')
+
+
+_LAST_GOOD = {}  # per-symbol memory: heal tiles a rate-limited pass left empty
 
 
 def quotes_for(pairs, with_chart=False):
@@ -326,26 +363,41 @@ def quotes_for(pairs, with_chart=False):
             quotes.update(spark_batch(syms[i:i + 20]))
     except Exception:
         pass
-    for sym in syms:  # fill gaps via fallback sources, politely throttled
-        q = quotes.get(sym)
-        if q and q.get('price') is not None:
-            continue
-        try:
-            quotes[sym] = fallback_quote(sym, with_chart=with_chart)
-        except Exception:
-            pass
-        time.sleep(0.12)
+    for attempt in range(2):  # fill gaps via fallback sources, politely throttled
+        missing = [s for s in syms
+                   if not (quotes.get(s) and quotes[s].get('price') is not None)]
+        if not missing:
+            break
+        if attempt:
+            time.sleep(1.5)  # let the Cboe rate limiter cool off before retrying
+        for sym in missing:
+            try:
+                quotes[sym] = fallback_quote(sym, with_chart=with_chart)
+            except Exception:
+                pass
+            time.sleep(0.25)
     out = []
     for sym, name in pairs:
-        q = quotes.get(sym) or {'symbol': sym, 'price': None,
-                                'changePct': None, 'spark': []}
+        q = quotes.get(sym)
+        if q and q.get('price') is not None:
+            _LAST_GOOD[sym] = q
+        else:
+            q = _LAST_GOOD.get(sym)
+        q = dict(q) if q else {'symbol': sym, 'price': None,
+                               'changePct': None, 'spark': []}
         q['name'] = q.pop('rename', None) or name
         out.append(q)
     return out
 
 
 def get_markets():
-    return cached('markets', 240, lambda: quotes_for(MARKETS, with_chart=True))
+    data = cached('markets', 240, lambda: quotes_for(MARKETS, with_chart=True))
+    if any(q.get('price') is None for q in data):
+        with _lock:  # incomplete build: age the cache so it refreshes after 60s
+            hit = _cache.get('markets')
+            if hit:
+                _cache['markets'] = (min(hit[0], time.time() - 180), hit[1])
+    return data
 
 
 def get_theme(name):
@@ -537,6 +589,19 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.end_headers()
                 self.wfile.write(body)
                 return
+            # static assets (icons, manifest) — path-traversal safe
+            safe = {'/manifest.webmanifest': 'application/manifest+json'}
+            if path in safe or (path.startswith('/icons/') and re.fullmatch(r'/icons/[\w.-]+\.png', path)):
+                fpath = os.path.join(os.path.dirname(__file__), path.lstrip('/'))
+                if os.path.isfile(fpath):
+                    with open(fpath, 'rb') as f:
+                        body = f.read()
+                    self.send_response(200)
+                    self.send_header('Content-Type', safe.get(path, 'image/png'))
+                    self.send_header('Cache-Control', 'public, max-age=86400')
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
             self._json({'error': 'not found'}, 404)
         except Exception as e:
             self._json({'error': str(e)[:200]}, 502)
